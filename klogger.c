@@ -12,6 +12,7 @@
 #define CLASS_NAME "klogger"
 #define LOG_BUF_LEN (1 << 5)
 #define MSG_LEN 8 
+#define MAX_ENTRIES (LOG_BUF_LEN / MSG_LEN);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Lionel Silva");
@@ -25,6 +26,7 @@ struct klogger {
     size_t log_lines;
     struct mutex log_mutex;
     atomic_t open_count;
+    atomic_t entries;
     struct class *device_class;
     struct device *device;
     int major_number;
@@ -66,8 +68,40 @@ static ssize_t dev_read(struct file *filep, char __user *user_buffer, size_t cou
 
 
 static ssize_t dev_write(struct file *filep, const char __user *user_buffer, size_t count, loff_t *file_pos) {
-    // TODO
-    return 0;
+    size_t msg_size = MSG_LEN;
+    size_t max_entries = MAX_ENTRIES;
+
+    // If incoming data is larger than the buffer, truncate to keep only the latest part
+    if (count >= msg_size) {
+        user_buffer += count - (msg_size - 1);
+        count = msg_size - 1;
+    }
+
+    mutex_lock(&klog.log_mutex);
+
+    memset(klog.log_buffer + (klog.head * msg_size), 0, msg_size);
+    if (copy_from_user(&klog.log_buffer[klog.head * msg_size], user_buffer, count)) {
+        mutex_unlock(&klog.log_mutex);
+        return -EFAULT;
+    }
+
+    klog.log_buffer[(klog.head * msg_size) + count] = '\n';
+
+    size_t log_entries = atomic_inc_return(&klog.entries);
+
+    if (log_entries > max_entries) {
+        log_entries = atomic_dec_return(&klog.entries);
+    }
+
+    klog.head = (klog.head + 1) & (max_entries - 1);
+    if (log_entries == max_entries && klog.head == klog.tail) {
+        klog.tail = (klog.tail + 1) & (max_entries - 1);
+    }
+
+    mutex_unlock(&klog.log_mutex);  // Unlock after writing
+
+
+    return count; // Return number of bytes written
 }
 
 
@@ -85,6 +119,9 @@ static int __init klogger_init(void) {
     mutex_init(&klog.log_mutex);
     // rwlock_init(&klog.rwlock);
     atomic_set(&klog.open_count, 0);
+    atomic_set(&klog.entries, 0);
+
+
 
     // Register major number
     klog.major_number = register_chrdev(0, DEVICE_NAME, &fops);
