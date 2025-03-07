@@ -7,13 +7,19 @@ sudo chmod 666 /dev/klogger
 
 make clean
 
-echo "Hel1" > /dev/klogger
-echo "Hel2" > /dev/klogger
-echo "Hel3" > /dev/klogger
-echo "Hel4" > /dev/klogger
-echo "Hel5" > /dev/klogger
-echo "Hel6" > /dev/klogger
-echo "Hel7" > /dev/klogger
+
+for i in {1..7}
+do
+    echo "Hello$i" > /dev/klogger
+done
+
+cat /dev/klogger
+
+# Expected output: 
+# Hello4
+# Hello5
+# Hello6
+# Hello7
 
 sudo rmmod klogger
 

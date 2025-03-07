@@ -23,13 +23,14 @@ struct klogger {
     char *log_buffer;
     size_t head;
     size_t tail;
-    size_t log_lines;
+    size_t prev_head;
     struct mutex log_mutex;
     atomic_t open_count;
     atomic_t entries;
     struct class *device_class;
     struct device *device;
     int major_number;
+    bool full;
 } klog_t;
 
 static struct klogger klog;
@@ -57,8 +58,45 @@ static int dev_release(struct inode *inodep, struct file *filep) {
 }
 
 static ssize_t dev_read(struct file *filep, char __user *user_buffer, size_t count, loff_t *file_pos) {
-    //TODO
-   return count;
+    size_t msg_size = MSG_LEN;
+    size_t max_entries = MAX_ENTRIES;
+
+    if (!user_buffer || count == 0) {
+        return -EINVAL;
+    }
+
+    if (*file_pos >= LOG_BUF_LEN) {
+        return 0;
+    }
+
+    if (count > LOG_BUF_LEN) {
+        count = LOG_BUF_LEN;
+    }
+
+    mutex_lock(&klog.log_mutex);
+    size_t usr_idx = 0;
+    size_t bytes_to_copy = 0;
+    size_t i = klog.tail;
+
+    while (usr_idx + bytes_to_copy <= count) {
+        bytes_to_copy = strlen(klog.log_buffer + (i * msg_size));
+        if (copy_to_user(user_buffer + usr_idx, klog.log_buffer + (i * msg_size), bytes_to_copy) != 0) {
+            return -EFAULT;
+        }
+        usr_idx += bytes_to_copy;
+        if (i == klog.prev_head) {
+            break;
+        }
+        i = (i + 1) & (max_entries - 1); 
+    }
+
+    *file_pos = count;
+
+    mutex_unlock(&klog.log_mutex);
+
+    
+
+    return count;
 }
 
 
@@ -70,35 +108,46 @@ static ssize_t dev_read(struct file *filep, char __user *user_buffer, size_t cou
 static ssize_t dev_write(struct file *filep, const char __user *user_buffer, size_t count, loff_t *file_pos) {
     size_t msg_size = MSG_LEN;
     size_t max_entries = MAX_ENTRIES;
+    size_t bytes_to_copy = count;
+    size_t usr_idx = 0;
 
     // If incoming data is larger than the buffer, truncate to keep only the latest part
     if (count >= msg_size) {
-        user_buffer += count - (msg_size - 1);
-        count = msg_size - 1;
+        usr_idx = count - (msg_size - 1);
+        bytes_to_copy = msg_size - 1;
+    }
+
+    if (*file_pos >= msg_size) {
+        return 0;
     }
 
     mutex_lock(&klog.log_mutex);
 
-    memset(klog.log_buffer + (klog.head * msg_size), 0, msg_size);
-    if (copy_from_user(&klog.log_buffer[klog.head * msg_size], user_buffer, count)) {
+    if (atomic_read(&klog.entries) == max_entries && klog.head == klog.tail) {
+        klog.tail = (klog.tail + 1) & (max_entries - 1);
+    }
+    memset(klog.log_buffer + (klog.head * msg_size), '\0', msg_size);
+    if (copy_from_user(klog.log_buffer + (klog.head * msg_size), user_buffer + usr_idx, bytes_to_copy)) {
         mutex_unlock(&klog.log_mutex);
         return -EFAULT;
     }
 
-    klog.log_buffer[(klog.head * msg_size) + count] = '\n';
+    klog.log_buffer[(klog.head * msg_size) + bytes_to_copy] = '\0';
 
-    size_t log_entries = atomic_inc_return(&klog.entries);
 
-    if (log_entries > max_entries) {
-        log_entries = atomic_dec_return(&klog.entries);
+    if (atomic_read(&klog.entries) < max_entries) {
+        atomic_inc(&klog.entries);
     }
+
+    klog.prev_head = klog.head;
 
     klog.head = (klog.head + 1) & (max_entries - 1);
-    if (log_entries == max_entries && klog.head == klog.tail) {
-        klog.tail = (klog.tail + 1) & (max_entries - 1);
-    }
+    
+
+    *file_pos = count;
 
     mutex_unlock(&klog.log_mutex);  // Unlock after writing
+
 
 
     return count; // Return number of bytes written
@@ -114,7 +163,7 @@ static int __init klogger_init(void) {
     memset(klog.log_buffer, 0, LOG_BUF_LEN);
     klog.head = 0;
     klog.tail = 0;
-    klog.log_lines = 0;
+    klog.prev_head = 0;
     // Initialize synchronization primitives
     mutex_init(&klog.log_mutex);
     // rwlock_init(&klog.rwlock);
