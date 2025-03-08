@@ -24,7 +24,7 @@ struct klogger {
     size_t head;
     size_t tail;
     size_t prev_head;
-    struct mutex log_mutex;
+    rwlock_t rwlock;
     atomic_t open_count;
     atomic_t entries;
     struct class *device_class;
@@ -74,7 +74,7 @@ static ssize_t dev_read(struct file *filep, char __user *user_buffer, size_t cou
         count = LOG_BUF_LEN;
     }
 
-    mutex_lock(&klog.log_mutex);
+    read_lock(&klog.rwlock);
     
     while (usr_idx <= count) {
         bytes_to_copy = strnlen(klog.log_buffer + (i * MSG_LEN), MSG_LEN);
@@ -87,13 +87,14 @@ static ssize_t dev_read(struct file *filep, char __user *user_buffer, size_t cou
         i = (i + 1) & (MAX_ENTRIES - 1); 
     }
 
+    read_unlock(&klog.rwlock);
+
     if (copy_to_user(user_buffer, buffer, usr_idx)) {
         return -EFAULT;
     }
 
     *file_pos = count;
 
-    mutex_unlock(&klog.log_mutex);
 
     return count;
 }
@@ -118,14 +119,14 @@ static ssize_t dev_write(struct file *filep, const char __user *user_buffer, siz
         return 0;
     }
 
-    mutex_lock(&klog.log_mutex);
+    write_lock(&klog.rwlock);
 
     if (atomic_read(&klog.entries) == MAX_ENTRIES && klog.head == klog.tail) {
         klog.tail = (klog.tail + 1) & (MAX_ENTRIES - 1);
     }
 
     if (copy_from_user(klog.log_buffer + (klog.head * MSG_LEN), user_buffer + usr_idx, bytes_to_copy)) {
-        mutex_unlock(&klog.log_mutex);
+        write_unlock(&klog.rwlock);
         return -EFAULT;
     }
 
@@ -138,7 +139,7 @@ static ssize_t dev_write(struct file *filep, const char __user *user_buffer, siz
     klog.prev_head = klog.head;
     klog.head = (klog.head + 1) & (MAX_ENTRIES - 1);
     
-    mutex_unlock(&klog.log_mutex);  // Unlock after writing
+    write_unlock(&klog.rwlock);  // Unlock after writing
 
     return count; // Return number of bytes written
 }
@@ -156,7 +157,7 @@ static int __init klogger_init(void) {
     klog.prev_head = 0;
 
     // Initialize synchronization primitives
-    mutex_init(&klog.log_mutex);
+    rwlock_init(&klog.rwlock);
     atomic_set(&klog.open_count, 0);
     atomic_set(&klog.entries, 0);
 
