@@ -13,6 +13,7 @@ do
     echo "Hello$i" > /dev/klogger
 done
 
+
 cat /dev/klogger
 
 # Expected output: 
@@ -22,5 +23,3 @@ cat /dev/klogger
 # Hello7
 
 sudo rmmod klogger
-
-sudo dmesg | tail -20
