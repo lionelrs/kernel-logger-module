@@ -19,8 +19,8 @@
 /* Device configuration */
 #define DEVICE_NAME "klogger"    /* Name of the device in /dev */
 #define CLASS_NAME "klogger"     /* Name of the device class */
-#define LOG_BUF_LEN (1 << 5)    /* Total buffer size (32 bytes) */
-#define MSG_LEN 8               /* Maximum length of each message */
+#define LOG_BUF_LEN (1 << 18)    /* Total buffer size (32 bytes) */
+#define MSG_LEN 256               /* Maximum length of each message */
 #define MAX_ENTRIES (LOG_BUF_LEN / MSG_LEN)  /* Maximum number of messages in buffer */
 
 /* Module metadata */
@@ -124,10 +124,11 @@ static int dev_release(struct inode *inodep, struct file *filep) {
  * Return: Number of bytes read, or negative error code on failure
  */
 static ssize_t dev_read(struct file *filep, char __user *user_buffer, size_t count, loff_t *file_pos) {
-    size_t usr_idx = 0;
-    size_t bytes_to_copy = 0;
-    size_t i = klog.tail;
-    char buffer[LOG_BUF_LEN];
+    size_t bytes_read = 0;
+    size_t bytes_to_copy;
+    size_t current_pos = klog.tail;
+    size_t entries_read = 0;
+    char *buffer;
 
     if (!user_buffer || count == 0) {
         return -EINVAL;
@@ -137,32 +138,60 @@ static ssize_t dev_read(struct file *filep, char __user *user_buffer, size_t cou
         return 0;
     }
 
-    if (count > LOG_BUF_LEN) {
-        count = LOG_BUF_LEN;
+    // Allocate temporary buffer - limit to count size
+    buffer = kmalloc(min_t(size_t, count, LOG_BUF_LEN), GFP_KERNEL);
+    if (!buffer) {
+        return -ENOMEM;
     }
 
     read_lock(&klog.rwlock);
-    
-    while (usr_idx <= count) {
-        bytes_to_copy = strnlen(klog.log_buffer + (i * MSG_LEN), MSG_LEN);
-        memcpy(buffer + usr_idx, klog.log_buffer + (i * MSG_LEN), bytes_to_copy);
+    // Read until we fill the temp buffer or reach the head
+    while (bytes_read < count && entries_read < atomic_read(&klog.entries)) {
+
+        // Get length of current message
+        bytes_to_copy = strnlen(klog.log_buffer + (current_pos * MSG_LEN), MSG_LEN);
         
-        usr_idx += bytes_to_copy;
-        if (i == klog.prev_head) {
+        // Don't copy more than the user requested
+        if (bytes_read + bytes_to_copy > count) {
+            bytes_to_copy = count - bytes_read;
+        }
+
+        // Copy to temp buffer
+        memcpy(buffer + bytes_read,
+               klog.log_buffer + (current_pos * MSG_LEN),
+               bytes_to_copy);
+
+        bytes_read += bytes_to_copy;
+        entries_read++;
+
+        // Stop if we've reached the head
+        if (current_pos == klog.prev_head) {
             break;
         }
-        i = (i + 1) & (MAX_ENTRIES - 1); 
+
+        // Move to next entry
+        current_pos = (current_pos + 1) & (MAX_ENTRIES - 1);
     }
 
     read_unlock(&klog.rwlock);
 
-    if (copy_to_user(user_buffer, buffer, usr_idx)) {
+    if (*file_pos >= bytes_to_copy) {
+        return 0;
+    }
+
+    // Now copy all data to user space at once
+    if (copy_to_user(user_buffer, buffer, bytes_read)) {
+        kfree(buffer);
         return -EFAULT;
     }
 
-    *file_pos = count;
+    // Free the temporary buffer
+    kfree(buffer);
 
-    return count;
+    // Update file position with actual bytes read
+    *file_pos += bytes_read;
+
+    return bytes_read;
 }
 
 /**
@@ -228,15 +257,21 @@ static ssize_t dev_write(struct file *filep, const char __user *user_buffer, siz
 static int __init klogger_init(void) {
 
     // Initialize the device structure
-
+    // klog.log_buffer = kmalloc(LOG_BUF_LEN, GFP_KERNEL);
+    // if (!klog.log_buffer) {
+    //     printk(KERN_ERR "Failed to allocate ring buffer.\n");
+    //     return -ENOMEM;
+    // }
     memset(klog.log_buffer, 0, LOG_BUF_LEN);
     klog.head = 0;
     klog.tail = 0;
     klog.prev_head = 0;
 
-    // Initialize synchronization primitives
-    rwlock_init(&klog.rwlock);
-    atomic_set(&klog.open_count, 0);
+    // Initialize synchronization primitivesklog.log_buffer = kmalloc(LOG_BUF_LEN, GFP_KERNEL);
+    // if (!klog.log_buffer) {
+    //     printk(KERN_ERR "Failed to allocate ring buffer.\n");
+    //     return -ENOMEM;
+    // }
     atomic_set(&klog.entries, 0);
 
 
@@ -283,6 +318,9 @@ static int __init klogger_init(void) {
  * Warns if there are still open handles to the device.
  */
 static void __exit klogger_exit(void) {
+
+    // Free buffer
+    // kfree(klog.log_buffer);
 
     // if there are still handles open print a message
     if (atomic_read(&klog.open_count) != 0) {
