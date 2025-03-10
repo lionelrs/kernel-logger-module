@@ -1,3 +1,11 @@
+/*
+* klogger.c - A simple kernel-space circular buffer logger
+*
+* This module implements a character device driver that provides a circular buffer
+* for logging messages in kernel space. It supports concurrent access through
+* read-write locks and maintains a fixed-size buffer of messages.
+*/
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -8,17 +16,32 @@
 #include <linux/device.h>
 #include <linux/mutex.h>
 
-#define DEVICE_NAME "klogger"
-#define CLASS_NAME "klogger"
-#define LOG_BUF_LEN (1 << 5)
-#define MSG_LEN 8 
-#define MAX_ENTRIES (LOG_BUF_LEN / MSG_LEN)
+/* Device configuration */
+#define DEVICE_NAME "klogger"    /* Name of the device in /dev */
+#define CLASS_NAME "klogger"     /* Name of the device class */
+#define LOG_BUF_LEN (1 << 5)    /* Total buffer size (32 bytes) */
+#define MSG_LEN 8               /* Maximum length of each message */
+#define MAX_ENTRIES (LOG_BUF_LEN / MSG_LEN)  /* Maximum number of messages in buffer */
 
+/* Module metadata */
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Lionel Silva");
 MODULE_DESCRIPTION("Kernel-space Logger");
 MODULE_VERSION("0.1");
 
+/**
+ * struct klogger - Main data structure for the kernel logger
+ * @log_buffer: Circular buffer to store messages
+ * @head: Index where next write will occur
+ * @tail: Index where next read will start
+ * @prev_head: Previous head position for read operations
+ * @rwlock: Read-write lock for thread safety
+ * @open_count: Number of processes currently using the device
+ * @entries: Current number of valid entries in the buffer
+ * @device_class: Pointer to the device class
+ * @device: Pointer to the device structure
+ * @major_number: Major number assigned to the device
+ */
 struct klogger {
     char log_buffer[LOG_BUF_LEN];
     size_t head;
@@ -32,30 +55,74 @@ struct klogger {
     int major_number;
 } klog_t;
 
+/* Global instance of the logger */
 static struct klogger klog;
 
+/* Function prototypes */
 static int dev_open(struct inode *inodep, struct file *filep);
 static int dev_release(struct inode *inodep, struct file *filep);
-static ssize_t dev_read(struct file *filep, char *user_buffer, size_t count, loff_t *file_pos);
-static ssize_t dev_write(struct file *filep, const char *user_buffer, size_t count, loff_t *file_pos);
+static ssize_t dev_read(struct file *filep, char __user *user_buffer, size_t count, loff_t *file_pos);
+static ssize_t dev_write(struct file *filep, const char __user *user_buffer, size_t count, loff_t *file_pos);
 
+/* File operations structure */
 static struct file_operations fops = {
+    .owner = THIS_MODULE,
     .open = dev_open,
     .read = dev_read,
     .write = dev_write,
     .release = dev_release,
 };
 
+/**
+ * dev_open() - Called when a process opens the device
+ * @inodep: Pointer to the inode object
+ * @filep: Pointer to the file object
+ *
+ * Increments the open_count to track number of processes using the device.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
 static int dev_open(struct inode *inodep, struct file *filep) {
-    // TODO
+    // Check for potential overflow before incrementing
+    if (atomic_read(&klog.open_count) == INT_MAX) {
+        printk(KERN_ERR "klogger: Too many open handles\n");
+        return -EMFILE;
+    }
+    atomic_inc(&klog.open_count);
     return 0;
 }
 
+/**
+ * dev_release() - Called when a process closes the device
+ * @inodep: Pointer to the inode object
+ * @filep: Pointer to the file object
+ *
+ * Decrements the open_count when a process is done with the device.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
 static int dev_release(struct inode *inodep, struct file *filep) {
-    // TODO
+    // Check for underflow before decrementing
+    if (atomic_read(&klog.open_count) <= 0) {
+        printk(KERN_WARNING "klogger: Device close called but no open handles\n");
+        return -EINVAL;
+    }
+    atomic_dec(&klog.open_count);
     return 0;
 }
 
+/**
+ * dev_read() - Read messages from the circular buffer
+ * @filep: Pointer to the file object
+ * @user_buffer: Buffer in user space to store read data
+ * @count: Number of bytes to read
+ * @file_pos: Current position in file
+ *
+ * Reads messages from the circular buffer starting at the tail position.
+ * Uses read lock to ensure thread safety during read operations.
+ *
+ * Return: Number of bytes read, or negative error code on failure
+ */
 static ssize_t dev_read(struct file *filep, char __user *user_buffer, size_t count, loff_t *file_pos) {
     size_t usr_idx = 0;
     size_t bytes_to_copy = 0;
@@ -95,16 +162,22 @@ static ssize_t dev_read(struct file *filep, char __user *user_buffer, size_t cou
 
     *file_pos = count;
 
-
     return count;
 }
 
-
-
-
-
-
-
+/**
+ * dev_write() - Write a message to the circular buffer
+ * @filep: Pointer to the file object
+ * @user_buffer: Buffer in user space containing data to write
+ * @count: Number of bytes to write
+ * @file_pos: Current position in file
+ *
+ * Writes a message to the circular buffer at the head position.
+ * If buffer is full, overwrites oldest message.
+ * Uses write lock to ensure thread safety during write operations.
+ *
+ * Return: Number of bytes written, or negative error code on failure
+ */
 static ssize_t dev_write(struct file *filep, const char __user *user_buffer, size_t count, loff_t *file_pos) {
     size_t bytes_to_copy = count;
     size_t usr_idx = 0;
@@ -144,9 +217,14 @@ static ssize_t dev_write(struct file *filep, const char __user *user_buffer, siz
     return count; // Return number of bytes written
 }
 
-
-
-
+/**
+ * klogger_init() - Initialize the kernel logger module
+ *
+ * Initializes the circular buffer, synchronization primitives,
+ * and creates the character device.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
 static int __init klogger_init(void) {
 
     // Initialize the device structure
@@ -198,7 +276,18 @@ static int __init klogger_init(void) {
     return 0;
 }
 
+/**
+ * klogger_exit() - Cleanup and unregister the kernel logger module
+ *
+ * Destroys the character device, class, and frees resources.
+ * Warns if there are still open handles to the device.
+ */
 static void __exit klogger_exit(void) {
+
+    // if there are still handles open print a message
+    if (atomic_read(&klog.open_count) != 0) {
+        printk(KERN_WARNING "There are still %d device(s) open.\n", atomic_read(&klog.open_count));
+    }
 
     // Destroy device
     device_destroy(klog.device_class, MKDEV(klog.major_number, 0));
